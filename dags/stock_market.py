@@ -11,7 +11,7 @@ from astro import sql as aql
 from astro.files import File
 from astro.sql.table import Table, Metadata
 import requests
-
+import sqlalchemy
 
 SYMBOL='AAPL'
 
@@ -44,5 +44,54 @@ def stock_market():
         op_kwargs={'prices': '{{ ti.xcom_pull(task_ids="get_stock_prices") }}'},
     )
 
-    is_api_available() >> get_stock_prices >> store_prices
+    format_prices = DockerOperator(
+        task_id='format_prices',
+        max_active_tis_per_dag=1,
+        image='stock-market-pipeline/spark-app',
+        container_name='trigger_job',
+        environment={
+            'SPARK_APPLICATION_ARGS': '{{ ti.xcom_pull(task_ids="store_prices")}}'
+        },
+        api_version='auto',
+        auto_remove=True,
+        docker_url='tcp://docker-proxy:2375',
+        network_mode='container:spark-master',
+        tty=True,
+        xcom_all=False,
+        mount_tmp_dir=False
+    )
+
+    get_formatted_csv = PythonOperator(
+        task_id='get_formatted_csv',
+        python_callable=_get_formatted_prices_from_minio, 
+        op_kwargs={'location': '{{ ti.xcom_pull(task_ids="store_prices") }}'},
+    )
+
+    load_to_dw = aql.load_file(
+        task_id='load_to_dw',
+        input_file=File(path='{{ ti.xcom_pull(task_ids="get_formatted_csv") }}', conn_id='minio'),
+        output_table=Table(
+            name='stock_prices',
+            conn_id='postgres',
+            metadata=Metadata(schema='public'),
+            columns=[ # the order matters!
+                sqlalchemy.Column('timestamp', sqlalchemy.BigInteger, primary_key=True),
+                sqlalchemy.Column('close', sqlalchemy.Float),
+                sqlalchemy.Column('high', sqlalchemy.Float),
+                sqlalchemy.Column('low', sqlalchemy.Float),
+                sqlalchemy.Column('open', sqlalchemy.Float),
+                sqlalchemy.Column('volume', sqlalchemy.Integer),
+                sqlalchemy.Column('date', sqlalchemy.Date),
+            ]
+        )
+    )
+
+    chain(
+        is_api_available(),
+        get_stock_prices,
+        store_prices,
+        format_prices,
+        get_formatted_csv,
+        load_to_dw
+        )
 stock_market()
